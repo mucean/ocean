@@ -4,20 +4,24 @@ import (
 	"sync"
 	"errors"
 	"time"
+	"fmt"
 )
 
-var statusClosed = -1
-var statusStop = 0
-var statusEnable = 1
-var stopErr = errors.New("worker can't work at this time")
+const closedStatus int = 1
+const stopStatus int = 2
+const enableStatus int = 3
 
-func newWorker() worker {
-	return worker{startTime:time.Now()}
+func NewWorker() *worker {
+	worker := &worker{startTime:time.Now(), status:enableStatus}
+	worker.run()
+
+	return worker
 }
 
 type worker struct {
 	runOnce sync.Once
 	closeOnce sync.Once
+	sync.Mutex
 	p *Pool
 	t chan Task
 	status int
@@ -28,7 +32,7 @@ type worker struct {
 
 func (w *worker) run() {
 	w.runOnce.Do(func() {
-		if w.status == statusClosed {
+		if w.status == enableStatus {
 			panic(w.err.Error())
 		}
 
@@ -36,10 +40,10 @@ func (w *worker) run() {
 		go func() {
 			defer func() {
 				if err := recover(); err != nil {
-					w.close()
+					w.close(errors.New(fmt.Sprint(err)))
 				}
 			}()
-			for t := <-w.t; w.status != statusClosed; t = <-w.t {
+			for t := <-w.t; w.status != closedStatus; t = <-w.t {
 				if t != nil {
 					t.Handle()
 				}
@@ -51,7 +55,7 @@ func (w *worker) run() {
 }
 
 func (w *worker) Send(t Task) error {
-	if w.status != statusEnable {
+	if w.status != enableStatus {
 		return w.err
 	}
 	w.t <- t
@@ -60,55 +64,54 @@ func (w *worker) Send(t Task) error {
 }
 
 func (w *worker) Close() {
-	w.close()
+	w.close(errors.New("worker is closed"))
 }
 
-func (w *worker) enable() error {
-	if w.status == statusClosed {
+func (w *worker) Enable() error {
+	if w.status == closedStatus {
 		return w.err
 	}
 
-	w.enableStatus()
-
-	return nil
-}
-
-func (w *worker) stop() error {
-	if w.status == statusClosed {
-		return w.err
+	if w.status == enableStatus {
+		return nil
 	}
 
-	w.stopStatus()
-	w.err = stopErr
+	return w.changeStatus(enableStatus)
+}
+
+func (w *worker) Stop(err error) error {
+	if e := w.changeStatus(stopStatus); e != nil {
+		return e
+	}
+	w.err = err
 
 	return nil
 }
 
 func (w *worker) recycle() {
 	w.p.recycle(w)
-	w.stop()
 }
 
-func (w *worker) close() {
+func (w *worker) close(err error) {
 	w.closeOnce.Do(func () {
 		close(w.t)
-		w.closeStatus()
-		w.err = errors.New("worker is closed")
+		w.changeStatus(closedStatus)
+		w.err = err
 	})
 }
 
-func (w *worker) closeStatus() {
-	w.changeStatus(statusClosed)
-}
-
-func (w *worker) stopStatus() {
-	w.changeStatus(statusStop)
-}
-
 func (w *worker) enableStatus() {
-	w.changeStatus(statusEnable)
+	w.changeStatus(enableStatus)
 }
 
-func (w *worker) changeStatus(status int) {
+func (w *worker) changeStatus(status int) error {
+	w.Lock()
+	defer w.Unlock()
+	if w.status == closedStatus {
+		return w.err
+	}
+
 	w.status = status
+
+	return nil
 }
